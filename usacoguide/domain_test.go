@@ -2,13 +2,7 @@ package usacoguide
 
 import (
 	"testing"
-
-	"github.com/tamnd/any-cli/kit"
 )
-
-// These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in usacoguide_test.go.
 
 func TestDomainInfo(t *testing.T) {
 	info := Domain{}.Info()
@@ -23,54 +17,78 @@ func TestDomainInfo(t *testing.T) {
 	}
 }
 
-func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
-	}
-	for _, tc := range cases {
-		typ, id, err := Domain{}.Classify(tc.in)
-		if err != nil || typ != tc.typ || id != tc.id {
-			t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
-				tc.in, typ, id, err, tc.typ, tc.id)
-		}
-	}
-}
-
-func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
-	if err != nil || got != want {
-		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
-	}
-}
-
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
-func TestHostWiring(t *testing.T) {
-	h, err := kit.Open()
+func TestClassify_id(t *testing.T) {
+	typ, id, err := Domain{}.Classify("time-complexity")
 	if err != nil {
 		t.Fatal(err)
 	}
+	if typ != "module" {
+		t.Errorf("typ = %q, want module", typ)
+	}
+	if id != "time-complexity" {
+		t.Errorf("id = %q, want time-complexity", id)
+	}
+}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
+func TestClassify_url(t *testing.T) {
+	typ, id, err := Domain{}.Classify("https://usaco.guide/bronze/time-complexity")
 	if err != nil {
-		t.Fatalf("Mint: %v", err)
+		t.Fatal(err)
 	}
-	if want := "usacoguide://page/wiki/Go"; u.String() != want {
-		t.Errorf("Mint = %q, want %q", u.String(), want)
+	if typ != "module" {
+		t.Errorf("typ = %q, want module", typ)
 	}
+	if id != "time-complexity" {
+		t.Errorf("id = %q, want time-complexity", id)
+	}
+}
 
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
+func TestLocate_module(t *testing.T) {
+	got, err := Domain{}.Locate("module", "time-complexity")
+	if err != nil {
+		t.Fatal(err)
 	}
+	want := "https://usaco.guide/time-complexity"
+	if got != want {
+		t.Errorf("Locate = %q, want %q", got, want)
+	}
+}
 
-	got, err := h.ResolveOn("usacoguide", "about")
-	if err != nil || got.String() != "usacoguide://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want usacoguide://page/about", got.String(), err)
+func TestLocate_unknownType(t *testing.T) {
+	_, err := Domain{}.Locate("unknown", "foo")
+	if err == nil {
+		t.Error("expected error for unknown type")
+	}
+}
+
+func TestParseFrontmatter(t *testing.T) {
+	content := []byte(`---
+id: time-complexity
+title: Time Complexity
+author: Benjamin Qi
+redirects:
+  - /bronze/time-complexity
+---
+
+# Time Complexity
+
+This module covers big-O notation.`)
+
+	fm := ParseFrontmatter(content)
+	if fm["title"] != "Time Complexity" {
+		t.Errorf("title = %q, want Time Complexity", fm["title"])
+	}
+	if fm["author"] != "Benjamin Qi" {
+		t.Errorf("author = %q, want Benjamin Qi", fm["author"])
+	}
+	if fm["id"] != "time-complexity" {
+		t.Errorf("id = %q, want time-complexity", fm["id"])
+	}
+}
+
+func TestParseFrontmatter_empty(t *testing.T) {
+	fm := ParseFrontmatter([]byte("# No frontmatter here"))
+	if len(fm) != 0 {
+		t.Errorf("expected empty map, got %v", fm)
 	}
 }
