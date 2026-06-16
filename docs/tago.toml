@@ -1,0 +1,10 @@
+title       = "usacoguide"
+baseURL     = "https://usacoguide-cli.tamnd.com/"
+description = "Browse USACO Guide modules from the command line"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/usacoguide-cli"
