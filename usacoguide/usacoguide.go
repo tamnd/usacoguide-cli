@@ -1,62 +1,266 @@
 // Package usacoguide is the library behind the usacoguide command line:
-// the HTTP client, request shaping, and the typed data models for usacoguide.
+// the HTTP client, request shaping, and typed data models for the USACO Guide.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The guide's source lives at github.com/cpinitiative/usaco-guide. This client
+// uses the GitHub API to list directories and fetches raw MDX files to parse
+// YAML frontmatter. No GitHub token is required (60 req/hr unauthenticated).
 package usacoguide
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to usacoguide. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "usacoguide/dev (+https://github.com/tamnd/usacoguide-cli)"
+// DefaultUserAgent identifies the client to the GitHub API.
+const DefaultUserAgent = "usacoguide-cli/dev (+https://github.com/tamnd/usacoguide-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at usacoguide.com; change it once you
-// know the real endpoints you want to read.
-const Host = "usacoguide.com"
+// Host is the usaco.guide site host.
+const Host = "usaco.guide"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// GuideURL is the USACO Guide web URL.
+const GuideURL = "https://usaco.guide"
 
-// Client talks to usacoguide over HTTP.
-type Client struct {
-	HTTP      *http.Client
-	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+// Config holds constructor parameters for the Client.
+type Config struct {
+	GitHubAPIURL string
+	RawGitHubURL string
+	UserAgent    string
+	Rate         time.Duration
+	Timeout      time.Duration
+	Retries      int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+// DefaultConfig returns sensible production defaults.
+func DefaultConfig() Config {
+	return Config{
+		GitHubAPIURL: "https://api.github.com/repos/cpinitiative/usaco-guide/contents/content",
+		RawGitHubURL: "https://raw.githubusercontent.com/cpinitiative/usaco-guide/main/content",
+		UserAgent:    DefaultUserAgent,
+		Rate:         300 * time.Millisecond,
+		Timeout:      30 * time.Second,
+		Retries:      3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// divisions maps the friendly division name to the directory name in the repo.
+var divisions = map[string]string{
+	"general":  "0_General",
+	"bronze":   "2_Bronze",
+	"silver":   "3_Silver",
+	"gold":     "4_Gold",
+	"platinum": "5_Plat",
+	"advanced": "6_Advanced",
+}
+
+// divisionOrder is the canonical order of divisions.
+var divisionOrder = []string{"general", "bronze", "silver", "gold", "platinum", "advanced"}
+
+// guidePathFor maps division to the URL path used on usaco.guide.
+var guidePathFor = map[string]string{
+	"general":  "general",
+	"bronze":   "bronze",
+	"silver":   "silver",
+	"gold":     "gold",
+	"platinum": "plat",
+	"advanced": "adv",
+}
+
+// Client talks to the GitHub API to read USACO Guide content.
+type Client struct {
+	cfg        Config
+	httpClient *http.Client
+	last       time.Time
+}
+
+// NewClient returns a Client ready to use.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:        cfg,
+		httpClient: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// Modules lists all modules, optionally filtered by division.
+func (c *Client) Modules(ctx context.Context, division string, limit int) ([]Module, error) {
+	var divs []string
+	if division == "" {
+		divs = divisionOrder
+	} else {
+		div := strings.ToLower(division)
+		if _, ok := divisions[div]; !ok {
+			return nil, fmt.Errorf("unknown division %q; valid: %s", division, strings.Join(divisionOrder, ", "))
+		}
+		divs = []string{div}
+	}
+
+	var result []Module
+	rank := 0
+	for _, div := range divs {
+		dirName := divisions[div]
+		files, err := c.listDirectory(ctx, dirName)
+		if err != nil {
+			return nil, err
+		}
+		for _, f := range files {
+			if f.Type != "file" || !strings.HasSuffix(f.Name, ".mdx") {
+				continue
+			}
+			id := strings.TrimSuffix(f.Name, ".mdx")
+			// Fetch raw MDX to parse frontmatter.
+			rawURL := c.cfg.RawGitHubURL + "/" + dirName + "/" + f.Name
+			body, err := c.get(ctx, rawURL)
+			if err != nil {
+				// Skip if we can't fetch (rate limit, etc.).
+				continue
+			}
+			fm := ParseFrontmatter(body)
+			title := fm["title"]
+			if title == "" {
+				title = id
+			}
+			author := fm["author"]
+			guidePath := guidePathFor[div]
+			url := GuideURL + "/" + guidePath + "/" + id
+
+			rank++
+			result = append(result, Module{
+				Rank:     rank,
+				ID:       id,
+				Title:    title,
+				Division: div,
+				Author:   author,
+				URL:      url,
+			})
+			if limit > 0 && len(result) >= limit {
+				return result, nil
+			}
+		}
+	}
+	return result, nil
+}
+
+// GetModule fetches a single module by ID, searching all divisions.
+func (c *Client) GetModule(ctx context.Context, id string) (*Module, error) {
+	for _, div := range divisionOrder {
+		dirName := divisions[div]
+		files, err := c.listDirectory(ctx, dirName)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if f.Type != "file" {
+				continue
+			}
+			fileID := strings.TrimSuffix(f.Name, ".mdx")
+			if fileID != id {
+				continue
+			}
+			rawURL := c.cfg.RawGitHubURL + "/" + dirName + "/" + f.Name
+			body, err := c.get(ctx, rawURL)
+			if err != nil {
+				return nil, err
+			}
+			fm := ParseFrontmatter(body)
+			title := fm["title"]
+			if title == "" {
+				title = id
+			}
+			guidePath := guidePathFor[div]
+			return &Module{
+				Rank:     1,
+				ID:       id,
+				Title:    title,
+				Division: div,
+				Author:   fm["author"],
+				URL:      GuideURL + "/" + guidePath + "/" + id,
+			}, nil
+		}
+	}
+	return nil, fmt.Errorf("module %q not found", id)
+}
+
+// Info returns aggregate statistics about the guide.
+func (c *Client) Info(ctx context.Context) (Info, error) {
+	total := 0
+	for _, div := range divisionOrder {
+		dirName := divisions[div]
+		files, err := c.listDirectory(ctx, dirName)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if f.Type == "file" && strings.HasSuffix(f.Name, ".mdx") {
+				total++
+			}
+		}
+	}
+	return Info{
+		TotalModules: total,
+		Divisions:    divisionOrder,
+		SourceURL:    "https://github.com/cpinitiative/usaco-guide",
+		GuideURL:     GuideURL,
+	}, nil
+}
+
+// listDirectory fetches the GitHub API directory listing for a subdirectory.
+func (c *Client) listDirectory(ctx context.Context, subdir string) ([]githubFile, error) {
+	url := c.cfg.GitHubAPIURL + "/" + subdir
+	body, err := c.get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	var files []githubFile
+	if err := json.Unmarshal(body, &files); err != nil {
+		return nil, fmt.Errorf("parse directory listing for %s: %w", subdir, err)
+	}
+	return files, nil
+}
+
+// ParseFrontmatter parses YAML frontmatter between "---" delimiters.
+// It returns a flat map of key: value pairs (string values only).
+func ParseFrontmatter(content []byte) map[string]string {
+	result := map[string]string{}
+	s := string(content)
+	if !strings.HasPrefix(s, "---") {
+		return result
+	}
+	// Find the closing ---.
+	rest := s[3:]
+	end := strings.Index(rest, "\n---")
+	if end < 0 {
+		return result
+	}
+	fm := rest[:end]
+	for _, line := range strings.Split(fm, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		idx := strings.Index(line, ":")
+		if idx < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:idx])
+		val := strings.TrimSpace(line[idx+1:])
+		// Strip surrounding quotes.
+		val = strings.Trim(val, `"'`)
+		if key != "" {
+			result[key] = val
+		}
+	}
+	return result
+}
+
+// get fetches a URL and returns the body bytes with pacing and retry.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +268,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +277,19 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -96,7 +301,6 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
-
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, true, err
@@ -104,12 +308,12 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
+// pace enforces the inter-request rate limit.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -118,83 +322,10 @@ func (c *Client) pace() {
 func backoff(attempt int) time.Duration {
 	d := time.Duration(attempt) * 500 * time.Millisecond
 	if d > 5*time.Second {
-		d = 5 * time.Second
+		return 5 * time.Second
 	}
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on usacoguide.com. It is a stand-in for the typed records you
-// will model from the real usacoguide endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `usacoguide cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
-}
+// nodeText is kept for interface compatibility but unused in this package.
+var _ = bytes.NewReader
